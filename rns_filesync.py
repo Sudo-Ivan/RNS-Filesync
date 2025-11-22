@@ -1047,7 +1047,8 @@ def peer_connected(link):
         identity_hash and check_permission(identity_hash, "read")
     ) or not whitelist_enabled:
         send_file_list_to_peer(link)
-        request_file_list_from_peer(link)
+        time.sleep(0.1)
+        request_file_list_from_peer(link, browser_mode=False)
     else:
         RNS.log("Peer does not have read permission, skipping file list", RNS.LOG_INFO)
 
@@ -1229,6 +1230,9 @@ def handle_peer_file_list(data, link):
     current_files = scan_directory(sync_directory)
     RNS.log(f"Comparing {len(peer_files)} peer files with {len(current_files)} local files", RNS.LOG_INFO)
     
+    if len(peer_files) == 0:
+        RNS.log("Peer has no files to sync", RNS.LOG_INFO)
+        return
 
     files_to_request = []
     files_to_sync = []
@@ -1249,10 +1253,7 @@ def handle_peer_file_list(data, link):
     if files_to_request or files_to_sync:
         RNS.log(f"Sync initiated: {len(files_to_request)} new files, {len(files_to_sync)} modified files", RNS.LOG_INFO)
     else:
-        if len(peer_files) == 0:
-            RNS.log("Peer has no files to sync", RNS.LOG_INFO)
-        else:
-            RNS.log("No files need syncing (all files match)", RNS.LOG_INFO)
+        RNS.log("No files need syncing (all files match)", RNS.LOG_INFO)
 
 
 def request_file(link, filepath):
@@ -1368,6 +1369,26 @@ def handle_file_request(data, link):
                             tui.update_status(speed=transfer_stats["current_speed"])
 
             resource.progress_callback(progress_callback)
+            
+            RNS.log(f"File {filepath} resource created, waiting for acceptance...", RNS.LOG_VERBOSE)
+            
+            timeout = 30
+            start_wait = time.time()
+            while resource.status < RNS.Resource.TRANSFERRING and resource.status != RNS.Resource.REJECTED:
+                if time.time() - start_wait > timeout:
+                    RNS.log(f"File {filepath} resource acceptance timeout", RNS.LOG_ERROR)
+                    resource.cancel()
+                    return
+                if resource.status == RNS.Resource.FAILED:
+                    RNS.log(f"File {filepath} resource failed", RNS.LOG_ERROR)
+                    return
+                time.sleep(0.1)
+            
+            if resource.status == RNS.Resource.REJECTED:
+                RNS.log(f"File {filepath} resource was rejected by peer", RNS.LOG_WARNING)
+                return
+            
+            RNS.log(f"File {filepath} resource accepted, transfer in progress...", RNS.LOG_VERBOSE)
             
             time.sleep(0.1)
 
@@ -1503,7 +1524,11 @@ def resource_callback(resource):
     
     if sender_identity:
         if whitelist_enabled:
-            if sender_identity.hash not in [h for h, _ in allowed_identities.items()]:
+            if not check_permission(sender_identity.hash, "write"):
+                RNS.log(
+                    f"Rejecting resource from {RNS.prettyhexrep(sender_identity.hash)} - no write permission",
+                    RNS.LOG_VERBOSE,
+                )
                 return False
         return True
     
@@ -2018,7 +2043,7 @@ def connect_to_peer(peer_hash_hex):
         if link not in connected_peers:
             connected_peers.append(link)
 
-    time.sleep(0.1)
+    time.sleep(0.2)
     
     try:
         remote_identity = link.get_remote_identity()
@@ -2029,11 +2054,15 @@ def connect_to_peer(peer_hash_hex):
             or not whitelist_enabled
         ):
             send_file_list_to_peer(link)
-            request_file_list_from_peer(link)
+            time.sleep(0.1)
+            request_file_list_from_peer(link, browser_mode=False)
+        else:
+            RNS.log("Peer does not have read permission, skipping file list", RNS.LOG_INFO)
     except Exception as e:
         RNS.log(f"Error setting up file sync on connect: {e}", RNS.LOG_DEBUG)
         send_file_list_to_peer(link)
-        request_file_list_from_peer(link)
+        time.sleep(0.1)
+        request_file_list_from_peer(link, browser_mode=False)
 
     RNS.log(f"Connected to peer {RNS.prettyhexrep(peer_hash)}", RNS.LOG_INFO)
     return link
