@@ -413,7 +413,8 @@ class SimpleTUI:
             Ending row position.
 
         """
-        view_height = self.terminal_height - start_row - 3
+        usable_height = self.terminal_height - 1
+        view_height = max(1, usable_height - start_row - 2)
 
         with self.view_lock:
             mode = self.view_mode
@@ -475,7 +476,8 @@ class SimpleTUI:
             Ending row position.
 
         """
-        log_height = self.terminal_height - start_row - 3
+        usable_height = self.terminal_height - 1
+        log_height = max(1, usable_height - start_row - 2)
 
         self.draw_box(start_row, 1, self.terminal_width - 2, log_height + 2, "Logs")
 
@@ -504,16 +506,20 @@ class SimpleTUI:
             restore_input: Whether to restore previously entered input.
 
         """
-        input_row = self.terminal_height - 1
+        self.update_terminal_size()
+        input_row = self.terminal_height
         self.move_cursor(input_row, 1)
         self.clear_line()
-        sys.stdout.write(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}>{Colors.RESET} ")
+        prompt = f"{Colors.BOLD}{Colors.BRIGHT_CYAN}>{Colors.RESET} "
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
 
         if restore_input:
             with self.input_lock:
-                sys.stdout.write(self.current_input)
-
-        sys.stdout.flush()
+                current_input = self.current_input
+                if current_input:
+                    sys.stdout.write(current_input)
+                    sys.stdout.flush()
 
     def save_current_input(self, text):
         """Save the current input text.
@@ -530,15 +536,23 @@ class SimpleTUI:
         with self.input_lock:
             self.current_input = ""
 
-    def refresh_display(self, full_clear=False):
+    def refresh_display(self, full_clear=False, refresh_input=False):
         """Refresh the entire TUI display.
 
         Args:
             full_clear: Whether to clear the screen before refreshing.
-
+            refresh_input: Whether to refresh the input area (default: False to avoid interrupting typing).
         """
         if not self.enabled:
             return
+
+        if full_clear:
+            refresh_input = True
+
+        saved_cursor = False
+        if not refresh_input:
+            sys.stdout.write("\033[s")  # save cursor position
+            saved_cursor = True
 
         self.update_terminal_size()
         self.hide_cursor()
@@ -557,10 +571,12 @@ class SimpleTUI:
         else:
             self.draw_files_area(content_start)
 
-        if not full_clear:
-            self.draw_input_area()
+        if refresh_input:
+            self.draw_input_area(restore_input=True)
 
         self.show_cursor()
+        if saved_cursor:
+            sys.stdout.write("\033[u")  # restore cursor position
         sys.stdout.flush()
 
     def start_refresh_timer(self):
@@ -568,7 +584,7 @@ class SimpleTUI:
         def refresh_loop():
             while self.enabled:
                 time.sleep(1)
-                self.refresh_display()
+                self.refresh_display(refresh_input=False)
 
         self.refresh_timer = threading.Thread(target=refresh_loop, daemon=True)
         self.refresh_timer.start()
@@ -1027,6 +1043,7 @@ def peer_connected(link):
         identity_hash and check_permission(identity_hash, "read")
     ) or not whitelist_enabled:
         send_file_list_to_peer(link)
+        request_file_list_from_peer(link)
     else:
         RNS.log("Peer does not have read permission, skipping file list", RNS.LOG_INFO)
 
@@ -1970,7 +1987,9 @@ def start_peer(
         try:
             if tui:
                 tui.draw_input_area(restore_input=False)
-            entered = input().strip()
+                entered = input("").strip()
+            else:
+                entered = input().strip()
 
             if tui:
                 tui.clear_current_input()
