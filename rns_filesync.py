@@ -1100,7 +1100,7 @@ def send_file_list_to_peer(link, browser_mode=False):
 
         packet = RNS.Packet(link, data)
         packet.send()
-        RNS.log(f"Sent file list ({len(file_list)} files) to peer", RNS.LOG_VERBOSE)
+        RNS.log(f"Sent file list ({len(file_list)} files, browser={browser_mode}) to peer", RNS.LOG_INFO)
 
     except Exception as e:
         RNS.log(f"Error sending file list: {e}", RNS.LOG_ERROR)
@@ -1192,7 +1192,7 @@ def handle_peer_file_list(data, link):
     peer_files = data.get("files", {})
     is_browser_response = data.get("browser", False)
 
-    RNS.log(f"Received file list from peer ({len(peer_files)} files)", RNS.LOG_INFO)
+    RNS.log(f"Received file list from peer ({len(peer_files)} files, browser={is_browser_response})", RNS.LOG_INFO)
 
     if is_browser_response and tui:
         remote_files = []
@@ -1210,18 +1210,33 @@ def handle_peer_file_list(data, link):
 
         return
 
-    current_files = scan_directory(sync_directory)
+    if not sync_directory:
+        RNS.log("Sync directory not set, cannot process file list", RNS.LOG_WARNING)
+        return
 
+    current_files = scan_directory(sync_directory)
+    RNS.log(f"Comparing {len(peer_files)} peer files with {len(current_files)} local files", RNS.LOG_INFO)
+
+    files_to_request = []
+    files_to_sync = []
+    
     with file_hashes_lock:
         for filepath, peer_info in peer_files.items():
             local_info = current_files.get(filepath)
 
             if not local_info:
-                RNS.log(f"Requesting new file: {filepath}", RNS.LOG_VERBOSE)
+                files_to_request.append(filepath)
+                RNS.log(f"Requesting new file: {filepath}", RNS.LOG_INFO)
                 request_file(link, filepath)
             elif local_info["hash"] != peer_info["hash"]:
-                RNS.log(f"File differs, requesting blocks: {filepath}", RNS.LOG_VERBOSE)
+                files_to_sync.append(filepath)
+                RNS.log(f"File differs, requesting blocks: {filepath}", RNS.LOG_INFO)
                 request_file_blocks(link, filepath)
+    
+    if files_to_request or files_to_sync:
+        RNS.log(f"Sync initiated: {len(files_to_request)} new files, {len(files_to_sync)} modified files", RNS.LOG_INFO)
+    else:
+        RNS.log("No files need syncing", RNS.LOG_INFO)
 
 
 def request_file(link, filepath):
@@ -1525,6 +1540,13 @@ def handle_file_complete(data, link):
     filepath = data.get("path")
     expected_hash = data.get("hash")
     mode = data.get("mode", "full")
+    
+    if filepath not in link.download_buffers:
+        RNS.log(f"No download buffer for {filepath}, waiting for chunks...", RNS.LOG_DEBUG)
+        time.sleep(0.5)
+        if filepath not in link.download_buffers:
+            RNS.log(f"No download buffer for {filepath} after wait", RNS.LOG_WARNING)
+            return
 
     try:
         remote_identity = link.get_remote_identity()
@@ -1547,6 +1569,31 @@ def handle_file_complete(data, link):
     try:
         buffer_info = link.download_buffers[filepath]
         chunks = sorted(buffer_info["chunks"], key=lambda x: x[0])
+        expected_size = buffer_info.get("size", 0)
+
+        if mode != "delta" and expected_size > 0:
+            total_received = sum(len(chunk[1]) for chunk in chunks)
+            expected_chunks = (expected_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+            
+            if len(chunks) < expected_chunks or total_received < expected_size:
+                RNS.log(
+                    f"File incomplete: {filepath} - received {len(chunks)}/{expected_chunks} chunks, "
+                    f"{total_received}/{expected_size} bytes. Waiting for remaining chunks...",
+                    RNS.LOG_WARNING,
+                )
+                time.sleep(1.0)
+                chunks = sorted(link.download_buffers[filepath]["chunks"], key=lambda x: x[0])
+                total_received = sum(len(chunk[1]) for chunk in chunks)
+                
+                if len(chunks) < expected_chunks or total_received < expected_size:
+                    RNS.log(
+                        f"File still incomplete after wait: {filepath} - received {len(chunks)}/{expected_chunks} chunks, "
+                        f"{total_received}/{expected_size} bytes. Requesting file again...",
+                        RNS.LOG_ERROR,
+                    )
+                    del link.download_buffers[filepath]
+                    request_file(link, filepath)
+                    return
 
         full_path = os.path.join(sync_directory, filepath)
         dir_path = os.path.dirname(full_path)
@@ -1569,6 +1616,14 @@ def handle_file_complete(data, link):
             RNS.log(f"Applied {len(chunks)} delta blocks to {filepath}", RNS.LOG_INFO)
         else:
             file_data = b"".join([chunk[1] for chunk in chunks])
+
+            if expected_size > 0 and len(file_data) != expected_size:
+                RNS.log(
+                    f"File size mismatch: {filepath} - expected {expected_size} bytes, got {len(file_data)} bytes",
+                    RNS.LOG_ERROR,
+                )
+                del link.download_buffers[filepath]
+                return
 
             with open(full_path, "wb") as f:
                 f.write(file_data)
