@@ -1172,7 +1172,6 @@ def packet_received(message, packet):
         data = umsgpack.unpackb(message)
         msg_type = data.get("type")
         
-        RNS.log(f"Received packet type: {msg_type}", RNS.LOG_DEBUG)
 
         if msg_type == "file_list":
             handle_peer_file_list(data, packet.link)
@@ -1230,8 +1229,6 @@ def handle_peer_file_list(data, link):
     current_files = scan_directory(sync_directory)
     RNS.log(f"Comparing {len(peer_files)} peer files with {len(current_files)} local files", RNS.LOG_INFO)
     
-    if len(peer_files) > 0:
-        RNS.log(f"Peer has files: {list(peer_files.keys())[:5]}{'...' if len(peer_files) > 5 else ''}", RNS.LOG_DEBUG)
 
     files_to_request = []
     files_to_sync = []
@@ -1352,8 +1349,9 @@ def handle_file_request(data, link):
             transfer_stats["last_transfer_bytes"] = 0
 
         try:
+            file_handle = open(full_path, "rb")
             resource = RNS.Resource(
-                open(full_path, "rb"),
+                file_handle,
                 link,
                 metadata=metadata,
                 auto_compress=True,
@@ -1370,22 +1368,8 @@ def handle_file_request(data, link):
                             tui.update_status(speed=transfer_stats["current_speed"])
 
             resource.progress_callback(progress_callback)
-
-            while resource.status < RNS.Resource.COMPLETE:
-                if resource.status > RNS.Resource.COMPLETE:
-                    RNS.log(f"File {filepath} transfer failed", RNS.LOG_ERROR)
-                    return
-                time.sleep(0.1)
-
-            end_time = time.time()
-            transfer_time = end_time - start_time
-
-            with transfer_stats_lock:
-                if transfer_time > 0:
-                    transfer_stats["current_speed"] = file_size / transfer_time
-                    transfer_stats["last_transfer_time"] = transfer_time
-
-            RNS.log(f"File {filepath} sent successfully", RNS.LOG_VERBOSE)
+            
+            time.sleep(0.1)
 
         except Exception as e:
             RNS.log(f"Error creating resource for {filepath}: {e}", RNS.LOG_ERROR)
@@ -1538,8 +1522,6 @@ def resource_started(resource):
     
     if filepath:
         RNS.log(f"Receiving file resource: {filepath}", RNS.LOG_INFO)
-    else:
-        RNS.log(f"Receiving resource: {RNS.prettyhexrep(resource.hash)}", RNS.LOG_DEBUG)
 
 
 def resource_concluded(resource):
@@ -1549,7 +1531,13 @@ def resource_concluded(resource):
         resource: RNS Resource object.
     """
     if resource.status != RNS.Resource.COMPLETE:
-        RNS.log(f"Resource transfer failed: {RNS.prettyhexrep(resource.hash)}", RNS.LOG_ERROR)
+        filepath = None
+        if resource.metadata and "filepath" in resource.metadata:
+            filepath = resource.metadata["filepath"].decode("utf-8")
+        if filepath:
+            RNS.log(f"Resource transfer failed for {filepath} (status: {resource.status})", RNS.LOG_ERROR)
+        else:
+            RNS.log(f"Resource transfer failed: {RNS.prettyhexrep(resource.hash)} (status: {resource.status})", RNS.LOG_ERROR)
         return
 
     if not resource.metadata or "filepath" not in resource.metadata:
