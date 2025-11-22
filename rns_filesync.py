@@ -1036,6 +1036,10 @@ def peer_connected(link):
 
     link.set_link_closed_callback(peer_disconnected)
     link.set_packet_callback(packet_received)
+    link.set_resource_strategy(RNS.Link.ACCEPT_APP)
+    link.set_resource_callback(resource_callback)
+    link.set_resource_started_callback(resource_started)
+    link.set_resource_concluded_callback(resource_concluded)
     link.download_buffers = {}
     link.upload_buffers = {}
 
@@ -1181,10 +1185,6 @@ def packet_received(message, packet):
             handle_block_hashes_response(data, packet.link)
         elif msg_type == "delta_request":
             handle_delta_request(data, packet.link)
-        elif msg_type == "file_chunk":
-            handle_file_chunk(data, packet.link)
-        elif msg_type == "file_complete":
-            handle_file_complete(data, packet.link)
         elif msg_type == "file_update":
             handle_file_update_notification(data, packet.link)
         elif msg_type == "file_deletion":
@@ -1338,60 +1338,57 @@ def handle_file_request(data, link):
         file_size = os.path.getsize(full_path)
         RNS.log(f"Sending file {filepath} ({file_size} bytes) to peer", RNS.LOG_INFO)
 
+        with file_hashes_lock:
+            file_hash = file_hashes.get(filepath, {}).get("hash")
+
+        metadata = {
+            "filepath": filepath.encode("utf-8"),
+            "hash": file_hash.encode("utf-8") if file_hash else b"",
+        }
+
         start_time = time.time()
         with transfer_stats_lock:
             transfer_stats["last_transfer_start"] = start_time
             transfer_stats["last_transfer_bytes"] = 0
 
-        with open(full_path, "rb") as f:
-            chunk_num = 0
-            while chunk := f.read(CHUNK_SIZE):
-                chunk_data = umsgpack.packb(
-                    {
-                        "type": "file_chunk",
-                        "path": filepath,
-                        "chunk_num": chunk_num,
-                        "data": chunk,
-                        "size": file_size,
-                        "mode": "full",
-                    },
-                )
+        try:
+            resource = RNS.Resource(
+                open(full_path, "rb"),
+                link,
+                metadata=metadata,
+                auto_compress=True,
+            )
 
-                packet = RNS.Packet(link, chunk_data)
-                packet.send()
-                chunk_num += 1
-
+            def progress_callback(resource):
                 with transfer_stats_lock:
-                    transfer_stats["last_transfer_bytes"] += len(chunk)
+                    progress = resource.get_progress()
+                    transfer_stats["last_transfer_bytes"] = int(progress * file_size)
+                    if tui:
+                        elapsed = time.time() - start_time
+                        if elapsed > 0:
+                            transfer_stats["current_speed"] = transfer_stats["last_transfer_bytes"] / elapsed
+                            tui.update_status(speed=transfer_stats["current_speed"])
 
-                time.sleep(0.01)
+            resource.progress_callback(progress_callback)
 
-        end_time = time.time()
-        transfer_time = end_time - start_time
+            while resource.status < RNS.Resource.COMPLETE:
+                if resource.status > RNS.Resource.COMPLETE:
+                    RNS.log(f"File {filepath} transfer failed", RNS.LOG_ERROR)
+                    return
+                time.sleep(0.1)
 
-        with transfer_stats_lock:
-            if transfer_time > 0:
-                transfer_stats["current_speed"] = file_size / transfer_time
-                transfer_stats["last_transfer_time"] = transfer_time
+            end_time = time.time()
+            transfer_time = end_time - start_time
 
-            if tui:
-                tui.update_status(speed=transfer_stats["current_speed"])
+            with transfer_stats_lock:
+                if transfer_time > 0:
+                    transfer_stats["current_speed"] = file_size / transfer_time
+                    transfer_stats["last_transfer_time"] = transfer_time
 
-        with file_hashes_lock:
-            file_hash = file_hashes.get(filepath, {}).get("hash")
+            RNS.log(f"File {filepath} sent successfully", RNS.LOG_VERBOSE)
 
-        complete_data = umsgpack.packb(
-            {
-                "type": "file_complete",
-                "path": filepath,
-                "hash": file_hash,
-            },
-        )
-
-        packet = RNS.Packet(link, complete_data)
-        packet.send()
-
-        RNS.log(f"File {filepath} sent successfully", RNS.LOG_VERBOSE)
+        except Exception as e:
+            RNS.log(f"Error creating resource for {filepath}: {e}", RNS.LOG_ERROR)
 
     except Exception as e:
         RNS.log(f"Error sending file {filepath}: {e}", RNS.LOG_ERROR)
@@ -1507,6 +1504,108 @@ def handle_delta_request(data, link):
 
     except Exception as e:
         RNS.log(f"Error sending delta for {filepath}: {e}", RNS.LOG_ERROR)
+
+
+def resource_callback(resource):
+    """Handle incoming resource and decide whether to accept it.
+
+    Args:
+        resource: RNS Resource object.
+
+    Returns:
+        True if resource should be accepted, False otherwise.
+    """
+    sender_identity = resource.link.get_remote_identity()
+    
+    if sender_identity:
+        if whitelist_enabled:
+            if sender_identity.hash not in [h for h, _ in allowed_identities.items()]:
+                return False
+        return True
+    
+    return not whitelist_enabled
+
+
+def resource_started(resource):
+    """Handle resource transfer started.
+
+    Args:
+        resource: RNS Resource object.
+    """
+    filepath = None
+    if resource.metadata and "filepath" in resource.metadata:
+        filepath = resource.metadata["filepath"].decode("utf-8")
+    
+    if filepath:
+        RNS.log(f"Receiving file resource: {filepath}", RNS.LOG_INFO)
+    else:
+        RNS.log(f"Receiving resource: {RNS.prettyhexrep(resource.hash)}", RNS.LOG_DEBUG)
+
+
+def resource_concluded(resource):
+    """Handle resource transfer completed.
+
+    Args:
+        resource: RNS Resource object.
+    """
+    if resource.status != RNS.Resource.COMPLETE:
+        RNS.log(f"Resource transfer failed: {RNS.prettyhexrep(resource.hash)}", RNS.LOG_ERROR)
+        return
+
+    if not resource.metadata or "filepath" not in resource.metadata:
+        RNS.log("Resource missing filepath metadata", RNS.LOG_ERROR)
+        return
+
+    filepath = resource.metadata["filepath"].decode("utf-8")
+    expected_hash = resource.metadata.get("hash", "").decode("utf-8") if isinstance(resource.metadata.get("hash"), bytes) else resource.metadata.get("hash", "")
+
+    try:
+        remote_identity = resource.link.get_remote_identity()
+        if remote_identity and whitelist_enabled:
+            if not check_permission(remote_identity.hash, "write"):
+                RNS.log(
+                    f"Peer {RNS.prettyhexrep(remote_identity.hash)} does not have write permission for {filepath}",
+                    RNS.LOG_WARNING,
+                )
+                return
+    except Exception as e:
+        RNS.log(f"Error checking permissions: {e}", RNS.LOG_DEBUG)
+
+    full_path = os.path.join(sync_directory, filepath)
+    dir_path = os.path.dirname(full_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    try:
+        shutil.move(resource.data.name, full_path)
+        file_size = os.path.getsize(full_path)
+        RNS.log(f"Received file {filepath} ({file_size} bytes)", RNS.LOG_INFO)
+
+        actual_hash = hash_file(full_path)
+
+        if expected_hash and actual_hash != expected_hash:
+            RNS.log(
+                f"Hash mismatch for {filepath}! Expected {expected_hash}, got {actual_hash}",
+                RNS.LOG_ERROR,
+            )
+            os.remove(full_path)
+            return
+
+        if actual_hash:
+            RNS.log(f"File {filepath} verified successfully", RNS.LOG_VERBOSE)
+
+            with file_hashes_lock:
+                file_hashes[filepath] = {
+                    "hash": actual_hash,
+                    "size": file_size,
+                    "mtime": time.time(),
+                }
+            save_hash_db(sync_directory)
+
+            broadcast_file_update(filepath, exclude_link=resource.link)
+
+    except Exception as e:
+        RNS.log(f"Error saving received file {filepath}: {e}", RNS.LOG_ERROR)
 
 
 def handle_block_hashes_response(data, link):
@@ -1922,6 +2021,10 @@ def connect_to_peer(peer_hash_hex):
         return None
 
     link.set_packet_callback(packet_received)
+    link.set_resource_strategy(RNS.Link.ACCEPT_APP)
+    link.set_resource_callback(resource_callback)
+    link.set_resource_started_callback(resource_started)
+    link.set_resource_concluded_callback(resource_concluded)
     
     with connected_peers_lock:
         if link not in connected_peers:
