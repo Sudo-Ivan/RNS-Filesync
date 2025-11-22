@@ -1549,7 +1549,9 @@ def handle_file_complete(data, link):
         chunks = sorted(buffer_info["chunks"], key=lambda x: x[0])
 
         full_path = os.path.join(sync_directory, filepath)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        dir_path = os.path.dirname(full_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
 
         if mode == "delta":
             if not os.path.exists(full_path):
