@@ -25,7 +25,7 @@ from RNS.vendor import umsgpack
 APP_NAME = "rns_filesync"
 APP_TIMEOUT = 30.0
 BLOCK_SIZE = 4096
-CHUNK_SIZE = 8192
+CHUNK_SIZE = 7000
 SCAN_INTERVAL = 5.0
 
 peer_identity = None
@@ -1106,24 +1106,28 @@ def send_file_list_to_peer(link, browser_mode=False):
         RNS.log(f"Error sending file list: {e}", RNS.LOG_ERROR)
 
 
-def request_file_list_from_peer(link):
-    """Request file list from a connected peer for browsing.
+def request_file_list_from_peer(link, browser_mode=False):
+    """Request file list from a connected peer.
 
     Args:
         link: RNS Link object for the peer.
+        browser_mode: Whether the request is for browsing UI.
 
     """
     try:
         data = umsgpack.packb(
             {
                 "type": "file_list_request",
-                "browser": True,
+                "browser": browser_mode,
             },
         )
 
         packet = RNS.Packet(link, data)
         packet.send()
-        RNS.log("Requested file list from peer for browsing", RNS.LOG_VERBOSE)
+        if browser_mode:
+            RNS.log("Requested file list from peer for browsing", RNS.LOG_VERBOSE)
+        else:
+            RNS.log("Requested file list from peer", RNS.LOG_VERBOSE)
 
     except Exception as e:
         RNS.log(f"Error requesting file list: {e}", RNS.LOG_ERROR)
@@ -2112,7 +2116,7 @@ def start_peer(
                                             with tui.remote_files_lock:
                                                 tui.remote_files = []
 
-                                        request_file_list_from_peer(link)
+                                        request_file_list_from_peer(link, browser_mode=True)
                                         RNS.log(
                                             f"Browsing peer {peer_idx}: {RNS.prettyhexrep(peer_hash)}",
                                             RNS.LOG_INFO,
@@ -2142,7 +2146,7 @@ def start_peer(
                                             tui.browser_peer = peer_hash
                                             with tui.remote_files_lock:
                                                 tui.remote_files = []
-                                        request_file_list_from_peer(link)
+                                        request_file_list_from_peer(link, browser_mode=True)
                                         RNS.log(
                                             f"Browsing peer: {RNS.prettyhexrep(peer_hash)}",
                                             RNS.LOG_INFO,
