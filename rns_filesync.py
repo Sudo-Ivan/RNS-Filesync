@@ -1087,8 +1087,19 @@ def send_file_list_to_peer(link, browser_mode=False):
 
     """
     try:
-        with file_hashes_lock:
-            file_list = {path: info for path, info in file_hashes.items()}
+        if sync_directory:
+            current_files = scan_directory(sync_directory)
+            with file_hashes_lock:
+                file_list = {}
+                for filepath, file_info in current_files.items():
+                    file_list[filepath] = {
+                        "hash": file_info["hash"],
+                        "size": file_info["size"],
+                        "mtime": file_info["mtime"],
+                    }
+        else:
+            with file_hashes_lock:
+                file_list = {path: info for path, info in file_hashes.items()}
 
         data = umsgpack.packb(
             {
@@ -1216,6 +1227,9 @@ def handle_peer_file_list(data, link):
 
     current_files = scan_directory(sync_directory)
     RNS.log(f"Comparing {len(peer_files)} peer files with {len(current_files)} local files", RNS.LOG_INFO)
+    
+    if len(peer_files) > 0:
+        RNS.log(f"Peer has files: {list(peer_files.keys())[:5]}{'...' if len(peer_files) > 5 else ''}", RNS.LOG_DEBUG)
 
     files_to_request = []
     files_to_sync = []
@@ -1236,7 +1250,10 @@ def handle_peer_file_list(data, link):
     if files_to_request or files_to_sync:
         RNS.log(f"Sync initiated: {len(files_to_request)} new files, {len(files_to_sync)} modified files", RNS.LOG_INFO)
     else:
-        RNS.log("No files need syncing", RNS.LOG_INFO)
+        if len(peer_files) == 0:
+            RNS.log("Peer has no files to sync", RNS.LOG_INFO)
+        else:
+            RNS.log("No files need syncing (all files match)", RNS.LOG_INFO)
 
 
 def request_file(link, filepath):
