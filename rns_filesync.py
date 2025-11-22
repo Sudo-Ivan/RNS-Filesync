@@ -1167,6 +1167,8 @@ def packet_received(message, packet):
     try:
         data = umsgpack.unpackb(message)
         msg_type = data.get("type")
+        
+        RNS.log(f"Received packet type: {msg_type}", RNS.LOG_DEBUG)
 
         if msg_type == "file_list":
             handle_peer_file_list(data, packet.link)
@@ -1918,6 +1920,29 @@ def connect_to_peer(peer_hash_hex):
     if link.status != RNS.Link.ACTIVE:
         RNS.log("Failed to establish link", RNS.LOG_ERROR)
         return None
+
+    link.set_packet_callback(packet_received)
+    
+    with connected_peers_lock:
+        if link not in connected_peers:
+            connected_peers.append(link)
+
+    time.sleep(0.1)
+    
+    try:
+        remote_identity = link.get_remote_identity()
+        identity_hash = remote_identity.hash if remote_identity else None
+        
+        if (
+            (identity_hash and check_permission(identity_hash, "read"))
+            or not whitelist_enabled
+        ):
+            send_file_list_to_peer(link)
+            request_file_list_from_peer(link)
+    except Exception as e:
+        RNS.log(f"Error setting up file sync on connect: {e}", RNS.LOG_DEBUG)
+        send_file_list_to_peer(link)
+        request_file_list_from_peer(link)
 
     RNS.log(f"Connected to peer {RNS.prettyhexrep(peer_hash)}", RNS.LOG_INFO)
     return link
