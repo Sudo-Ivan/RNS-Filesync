@@ -54,6 +54,9 @@ transfer_stats_lock = threading.Lock()
 active_outgoing_transfers = {}
 active_outgoing_transfers_lock = threading.Lock()
 
+active_resources = {}
+active_resources_lock = threading.Lock()
+
 
 class Colors:
     """ANSI color codes for terminal output."""
@@ -1372,6 +1375,19 @@ def handle_file_request(data, link):
             transfer_stats["last_transfer_bytes"] = 0
 
         try:
+            def send_concluded_callback(resource):
+                with active_outgoing_transfers_lock:
+                    active_outgoing_transfers.pop(transfer_key, None)
+                with active_resources_lock:
+                    active_resources.pop(transfer_key, None)
+
+                if resource.status == RNS.Resource.COMPLETE:
+                    RNS.log(f"File {filepath} sent successfully", RNS.LOG_INFO)
+                elif resource.status == RNS.Resource.FAILED:
+                    RNS.log(f"File {filepath} send failed", RNS.LOG_ERROR)
+                else:
+                    RNS.log(f"File {filepath} send concluded with status {resource.status}", RNS.LOG_WARNING)
+
             if file_size == 0:
                 RNS.log(f"Sending empty file {filepath} as bytes", RNS.LOG_DEBUG)
                 resource = RNS.Resource(
@@ -1379,6 +1395,7 @@ def handle_file_request(data, link):
                     link,
                     metadata=metadata,
                     auto_compress=False,
+                    callback=send_concluded_callback,
                 )
             else:
                 file_handle = open(full_path, "rb")
@@ -1387,7 +1404,11 @@ def handle_file_request(data, link):
                     link,
                     metadata=metadata,
                     auto_compress=True,
+                    callback=send_concluded_callback,
                 )
+
+            with active_resources_lock:
+                active_resources[transfer_key] = resource
 
             if file_size > 0:
                 def progress_callback(resource):
@@ -1402,47 +1423,25 @@ def handle_file_request(data, link):
 
                 resource.progress_callback(progress_callback)
 
-            RNS.log(f"File {filepath} resource created, waiting for acceptance...", RNS.LOG_VERBOSE)
-
-            timeout = 30
-            start_wait = time.time()
-            while resource.status < RNS.Resource.TRANSFERRING and resource.status != RNS.Resource.REJECTED:
-                if time.time() - start_wait > timeout:
-                    RNS.log(f"File {filepath} resource acceptance timeout", RNS.LOG_ERROR)
-                    resource.cancel()
-                    with active_outgoing_transfers_lock:
-                        active_outgoing_transfers.pop(transfer_key, None)
-                    return
-                if resource.status == RNS.Resource.FAILED:
-                    RNS.log(f"File {filepath} resource failed", RNS.LOG_ERROR)
-                    with active_outgoing_transfers_lock:
-                        active_outgoing_transfers.pop(transfer_key, None)
-                    return
-                time.sleep(0.1)
-
-            if resource.status == RNS.Resource.REJECTED:
-                RNS.log(f"File {filepath} resource was rejected by peer", RNS.LOG_WARNING)
-                with active_outgoing_transfers_lock:
-                    active_outgoing_transfers.pop(transfer_key, None)
-                return
-
-            RNS.log(f"File {filepath} resource accepted, transfer in progress...", RNS.LOG_VERBOSE)
-
-            def cleanup_transfer():
-                with active_outgoing_transfers_lock:
-                    active_outgoing_transfers.pop(transfer_key, None)
-
-            threading.Timer(5.0, cleanup_transfer).start()
+            RNS.log(f"File {filepath} resource created and advertised", RNS.LOG_INFO)
 
         except Exception as e:
             RNS.log(f"Error creating resource for {filepath}: {e}", RNS.LOG_ERROR)
+            import traceback
+            RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
             with active_outgoing_transfers_lock:
                 active_outgoing_transfers.pop(transfer_key, None)
+            with active_resources_lock:
+                active_resources.pop(transfer_key, None)
 
     except Exception as e:
         RNS.log(f"Error sending file {filepath}: {e}", RNS.LOG_ERROR)
+        import traceback
+        RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
         with active_outgoing_transfers_lock:
             active_outgoing_transfers.pop(transfer_key, None)
+        with active_resources_lock:
+            active_resources.pop(transfer_key, None)
 
 
 def handle_delta_request(data, link):
@@ -1642,35 +1641,51 @@ def resource_started(resource):
     """
     filepath = None
     if resource.metadata and "filepath" in resource.metadata:
-        filepath = resource.metadata["filepath"].decode("utf-8")
+        try:
+            filepath = resource.metadata["filepath"].decode("utf-8")
+        except Exception:
+            pass
 
     if filepath:
-        RNS.log(f"Receiving file resource: {filepath}", RNS.LOG_INFO)
+        size = resource.size if hasattr(resource, "size") else 0
+        RNS.log(f"Resource transfer started: {filepath} ({size} bytes)", RNS.LOG_INFO)
+    else:
+        size = resource.size if hasattr(resource, "size") else 0
+        RNS.log(f"Resource transfer started: {size} bytes (no filename)", RNS.LOG_VERBOSE)
 
 
 def resource_concluded(resource):
-    """Handle resource transfer completed.
+    """Handle resource transfer completed (receiver side).
 
     Args:
         resource: RNS Resource object.
 
     """
-    if resource.status != RNS.Resource.COMPLETE:
-        filepath = None
-        if resource.metadata and "filepath" in resource.metadata:
-            filepath = resource.metadata["filepath"].decode("utf-8")
-        if filepath:
-            RNS.log(f"Resource transfer failed for {filepath} (status: {resource.status})", RNS.LOG_ERROR)
-        else:
-            RNS.log(f"Resource transfer failed: {RNS.prettyhexrep(resource.hash)} (status: {resource.status})", RNS.LOG_ERROR)
-        return
+    try:
+        if resource.status != RNS.Resource.COMPLETE:
+            filepath = None
+            if resource.metadata and "filepath" in resource.metadata:
+                try:
+                    filepath = resource.metadata["filepath"].decode("utf-8")
+                except Exception:
+                    pass
+            if filepath:
+                RNS.log(f"Resource transfer failed for {filepath} (status: {resource.status})", RNS.LOG_ERROR)
+            else:
+                RNS.log(f"Resource transfer failed (status: {resource.status})", RNS.LOG_ERROR)
+            return
 
-    if not resource.metadata or "filepath" not in resource.metadata:
-        RNS.log("Resource missing filepath metadata", RNS.LOG_ERROR)
-        return
+        if not resource.metadata or "filepath" not in resource.metadata:
+            RNS.log("Resource missing filepath metadata", RNS.LOG_WARNING)
+            return
 
-    filepath = resource.metadata["filepath"].decode("utf-8")
-    expected_hash = resource.metadata.get("hash", "").decode("utf-8") if isinstance(resource.metadata.get("hash"), bytes) else resource.metadata.get("hash", "")
+        filepath = resource.metadata["filepath"].decode("utf-8")
+        expected_hash = resource.metadata.get("hash", "").decode("utf-8") if isinstance(resource.metadata.get("hash"), bytes) else resource.metadata.get("hash", "")
+
+        RNS.log(f"Processing received resource for {filepath}", RNS.LOG_VERBOSE)
+    except Exception as e:
+        RNS.log(f"Error in resource_concluded metadata extraction: {e}", RNS.LOG_ERROR)
+        return
 
     try:
         remote_identity = resource.link.get_remote_identity()
