@@ -1197,6 +1197,8 @@ def packet_received(message, packet):
             handle_file_chunk(data, packet.link)
         elif msg_type == "file_complete":
             handle_file_complete(data, packet.link)
+        elif msg_type == "empty_file":
+            handle_empty_file(data, packet.link)
         elif msg_type == "file_update":
             handle_file_update_notification(data, packet.link)
         elif msg_type == "file_deletion":
@@ -1389,14 +1391,25 @@ def handle_file_request(data, link):
                     RNS.log(f"File {filepath} send concluded with status {resource.status}", RNS.LOG_WARNING)
 
             if file_size == 0:
-                RNS.log(f"Sending empty file {filepath} as bytes", RNS.LOG_DEBUG)
-                resource = RNS.Resource(
-                    b"",
-                    link,
-                    metadata=metadata,
-                    auto_compress=False,
-                    callback=send_concluded_callback,
-                )
+                RNS.log(f"Sending empty file notification for {filepath} via packet", RNS.LOG_INFO)
+                
+                with file_hashes_lock:
+                    file_hash = file_hashes.get(filepath, {}).get("hash")
+                
+                empty_file_data = umsgpack.packb({
+                    "type": "empty_file",
+                    "path": filepath,
+                    "hash": file_hash,
+                })
+                
+                packet = RNS.Packet(link, empty_file_data)
+                packet.send()
+                
+                with active_outgoing_transfers_lock:
+                    active_outgoing_transfers.pop(transfer_key, None)
+                
+                RNS.log(f"Empty file {filepath} notification sent", RNS.LOG_DEBUG)
+                return
             else:
                 file_handle = open(full_path, "rb")
                 resource = RNS.Resource(
@@ -1639,19 +1652,15 @@ def resource_started(resource):
         resource: RNS Resource object.
 
     """
-    filepath = None
-    if resource.metadata and "filepath" in resource.metadata:
-        try:
-            filepath = resource.metadata["filepath"].decode("utf-8")
-        except Exception:
-            pass
-
-    if filepath:
-        size = resource.size if hasattr(resource, "size") else 0
-        RNS.log(f"Resource transfer started: {filepath} ({size} bytes)", RNS.LOG_INFO)
-    else:
-        size = resource.size if hasattr(resource, "size") else 0
-        RNS.log(f"Resource transfer started: {size} bytes (no filename)", RNS.LOG_VERBOSE)
+    size = resource.size if hasattr(resource, "size") else 0
+    total_size = resource.total_size if hasattr(resource, "total_size") else 0
+    parts = len(resource.parts) if hasattr(resource, "parts") and resource.parts else 0
+    has_meta = resource.has_metadata if hasattr(resource, "has_metadata") else False
+    
+    RNS.log(
+        f"Resource transfer started: size={size}, total_size={total_size}, parts={parts}, has_metadata={has_meta}",
+        RNS.LOG_INFO,
+    )
 
 
 def resource_concluded(resource):
@@ -1661,30 +1670,58 @@ def resource_concluded(resource):
         resource: RNS Resource object.
 
     """
+    status_names = {
+        0x00: "NONE/REJECTED",
+        0x01: "QUEUED",
+        0x02: "ADVERTISED",
+        0x03: "TRANSFERRING",
+        0x04: "AWAITING_PROOF",
+        0x05: "ASSEMBLING",
+        0x06: "COMPLETE",
+        0x07: "FAILED",
+        0x08: "CORRUPT",
+    }
+    
     try:
+        status_name = status_names.get(resource.status, f"UNKNOWN({resource.status})")
+        
         if resource.status != RNS.Resource.COMPLETE:
+            size = resource.size if hasattr(resource, "size") else 0
+            parts = len(resource.parts) if hasattr(resource, "parts") and resource.parts else 0
+            
             filepath = None
-            if resource.metadata and "filepath" in resource.metadata:
+            if resource.metadata:
                 try:
-                    filepath = resource.metadata["filepath"].decode("utf-8")
-                except Exception:
-                    pass
+                    if isinstance(resource.metadata, dict) and "filepath" in resource.metadata:
+                        filepath = resource.metadata["filepath"].decode("utf-8") if isinstance(resource.metadata["filepath"], bytes) else resource.metadata["filepath"]
+                except Exception as e:
+                    RNS.log(f"Could not decode filepath from metadata: {e}", RNS.LOG_DEBUG)
+            
             if filepath:
-                RNS.log(f"Resource transfer failed for {filepath} (status: {resource.status})", RNS.LOG_ERROR)
+                RNS.log(
+                    f"Resource transfer failed for {filepath}: status={status_name}, size={size}, parts={parts}",
+                    RNS.LOG_ERROR,
+                )
             else:
-                RNS.log(f"Resource transfer failed (status: {resource.status})", RNS.LOG_ERROR)
+                RNS.log(
+                    f"Resource transfer failed: status={status_name}, size={size}, parts={parts}",
+                    RNS.LOG_ERROR,
+                )
             return
 
         if not resource.metadata or "filepath" not in resource.metadata:
-            RNS.log("Resource missing filepath metadata", RNS.LOG_WARNING)
+            RNS.log(f"Resource missing filepath metadata, type: {type(resource.metadata)}", RNS.LOG_WARNING)
             return
 
-        filepath = resource.metadata["filepath"].decode("utf-8")
-        expected_hash = resource.metadata.get("hash", "").decode("utf-8") if isinstance(resource.metadata.get("hash"), bytes) else resource.metadata.get("hash", "")
+        filepath = resource.metadata["filepath"].decode("utf-8") if isinstance(resource.metadata["filepath"], bytes) else resource.metadata["filepath"]
+        expected_hash_raw = resource.metadata.get("hash", b"")
+        expected_hash = expected_hash_raw.decode("utf-8") if isinstance(expected_hash_raw, bytes) else expected_hash_raw
 
         RNS.log(f"Processing received resource for {filepath}", RNS.LOG_VERBOSE)
     except Exception as e:
         RNS.log(f"Error in resource_concluded metadata extraction: {e}", RNS.LOG_ERROR)
+        import traceback
+        RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
         return
 
     try:
@@ -1734,6 +1771,65 @@ def resource_concluded(resource):
 
     except Exception as e:
         RNS.log(f"Error saving received file {filepath}: {e}", RNS.LOG_ERROR)
+
+
+def handle_empty_file(data, link):
+    """Handle empty file notification from a peer.
+
+    Args:
+        data: Packet data dictionary containing file path and hash.
+        link: RNS Link object for the peer.
+
+    """
+    filepath = data.get("path")
+    expected_hash = data.get("hash")
+
+    if not filepath:
+        return
+
+    try:
+        remote_identity = link.get_remote_identity()
+        if remote_identity and whitelist_enabled:
+            if not check_permission(remote_identity.hash, "write"):
+                RNS.log(
+                    f"Peer {RNS.prettyhexrep(remote_identity.hash)} does not have write permission for {filepath}",
+                    RNS.LOG_WARNING,
+                )
+                return
+    except Exception as e:
+        RNS.log(f"Error checking permissions: {e}", RNS.LOG_DEBUG)
+
+    full_path = os.path.join(sync_directory, filepath)
+    dir_path = os.path.dirname(full_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    try:
+        with open(full_path, "wb") as f:
+            pass
+
+        RNS.log(f"Created empty file {filepath}", RNS.LOG_INFO)
+
+        actual_hash = hash_file(full_path)
+
+        if expected_hash and actual_hash != expected_hash:
+            RNS.log(
+                f"Hash mismatch for empty file {filepath}! Expected {expected_hash}, got {actual_hash}",
+                RNS.LOG_WARNING,
+            )
+
+        with file_hashes_lock:
+            file_hashes[filepath] = {
+                "hash": actual_hash,
+                "size": 0,
+                "mtime": time.time(),
+            }
+        save_hash_db(sync_directory)
+
+        broadcast_file_update(filepath, exclude_link=link)
+
+    except Exception as e:
+        RNS.log(f"Error creating empty file {filepath}: {e}", RNS.LOG_ERROR)
 
 
 def handle_block_hashes_response(data, link):
