@@ -1,5 +1,7 @@
 # RNS FileSync
 
+[Русская](README_RU.md)
+
 > [!WARNING]  
 > I still consider this experimental, use at your own risk.
 
