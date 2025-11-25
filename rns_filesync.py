@@ -1325,7 +1325,7 @@ def handle_file_request(data, link):
         return
 
     transfer_key = (id(link), filepath)
-    
+
     with active_outgoing_transfers_lock:
         if transfer_key in active_outgoing_transfers:
             RNS.log(f"Transfer already in progress for {filepath}, ignoring duplicate request", RNS.LOG_DEBUG)
@@ -1372,25 +1372,35 @@ def handle_file_request(data, link):
             transfer_stats["last_transfer_bytes"] = 0
 
         try:
-            file_handle = open(full_path, "rb")
-            resource = RNS.Resource(
-                file_handle,
-                link,
-                metadata=metadata,
-                auto_compress=True,
-            )
+            if file_size == 0:
+                RNS.log(f"Sending empty file {filepath} as bytes", RNS.LOG_DEBUG)
+                resource = RNS.Resource(
+                    b"",
+                    link,
+                    metadata=metadata,
+                    auto_compress=False,
+                )
+            else:
+                file_handle = open(full_path, "rb")
+                resource = RNS.Resource(
+                    file_handle,
+                    link,
+                    metadata=metadata,
+                    auto_compress=True,
+                )
 
-            def progress_callback(resource):
-                with transfer_stats_lock:
-                    progress = resource.get_progress()
-                    transfer_stats["last_transfer_bytes"] = int(progress * file_size)
-                    if tui:
-                        elapsed = time.time() - start_time
-                        if elapsed > 0:
-                            transfer_stats["current_speed"] = transfer_stats["last_transfer_bytes"] / elapsed
-                            tui.update_status(speed=transfer_stats["current_speed"])
+            if file_size > 0:
+                def progress_callback(resource):
+                    with transfer_stats_lock:
+                        progress = resource.get_progress()
+                        transfer_stats["last_transfer_bytes"] = int(progress * file_size)
+                        if tui:
+                            elapsed = time.time() - start_time
+                            if elapsed > 0:
+                                transfer_stats["current_speed"] = transfer_stats["last_transfer_bytes"] / elapsed
+                                tui.update_status(speed=transfer_stats["current_speed"])
 
-            resource.progress_callback(progress_callback)
+                resource.progress_callback(progress_callback)
 
             RNS.log(f"File {filepath} resource created, waiting for acceptance...", RNS.LOG_VERBOSE)
 
@@ -1417,11 +1427,11 @@ def handle_file_request(data, link):
                 return
 
             RNS.log(f"File {filepath} resource accepted, transfer in progress...", RNS.LOG_VERBOSE)
-            
+
             def cleanup_transfer():
                 with active_outgoing_transfers_lock:
                     active_outgoing_transfers.pop(transfer_key, None)
-            
+
             threading.Timer(5.0, cleanup_transfer).start()
 
         except Exception as e:
@@ -1450,7 +1460,7 @@ def handle_delta_request(data, link):
         return
 
     transfer_key = (id(link), filepath, "delta")
-    
+
     with active_outgoing_transfers_lock:
         if transfer_key in active_outgoing_transfers:
             RNS.log(f"Delta transfer already in progress for {filepath}, ignoring duplicate request", RNS.LOG_DEBUG)
@@ -1565,7 +1575,7 @@ def handle_delta_request(data, link):
         packet.send()
 
         RNS.log(f"Delta sent for {filepath}", RNS.LOG_VERBOSE)
-        
+
         with active_outgoing_transfers_lock:
             active_outgoing_transfers.pop(transfer_key, None)
 
@@ -1575,43 +1585,52 @@ def handle_delta_request(data, link):
             active_outgoing_transfers.pop(transfer_key, None)
 
 
-def resource_callback(resource):
-    """Handle incoming resource and decide whether to accept it.
+def resource_callback(resource_advertisement):
+    """Handle incoming resource advertisement and decide whether to accept it.
 
     Args:
-        resource: RNS Resource object.
+        resource_advertisement: RNS ResourceAdvertisement object.
 
     Returns:
         True if resource should be accepted, False otherwise.
 
     """
-    filepath = None
-    if resource.metadata and "filepath" in resource.metadata:
-        try:
-            filepath = resource.metadata["filepath"].decode("utf-8")
-        except Exception:
-            pass
-    
-    sender_identity = resource.link.get_remote_identity()
-    sender_hash = RNS.prettyhexrep(sender_identity.hash) if sender_identity else "unknown"
+    try:
+        transfer_size = resource_advertisement.get_transfer_size()
+        data_size = resource_advertisement.get_data_size()
+        has_meta = resource_advertisement.has_metadata()
 
-    if sender_identity:
-        if whitelist_enabled:
-            if not check_permission(sender_identity.hash, "write"):
-                RNS.log(
-                    f"Rejecting resource from {sender_hash} - no write permission" + (f" for {filepath}" if filepath else ""),
-                    RNS.LOG_WARNING,
-                )
-                return False
-        RNS.log(f"Accepting resource from {sender_hash}" + (f" for {filepath}" if filepath else ""), RNS.LOG_VERBOSE)
-        return True
+        RNS.log(
+            f"Resource advertisement received: transfer_size={transfer_size}, data_size={data_size}, has_metadata={has_meta}",
+            RNS.LOG_VERBOSE,
+        )
 
-    if not whitelist_enabled:
-        RNS.log(f"Accepting resource (no whitelist)" + (f" for {filepath}" if filepath else ""), RNS.LOG_VERBOSE)
-        return True
-    
-    RNS.log(f"Rejecting resource - no sender identity and whitelist enabled" + (f" for {filepath}" if filepath else ""), RNS.LOG_WARNING)
-    return False
+        sender_identity = resource_advertisement.link.get_remote_identity()
+        sender_hash = RNS.prettyhexrep(sender_identity.hash) if sender_identity else "unknown"
+
+        if sender_identity:
+            if whitelist_enabled:
+                if not check_permission(sender_identity.hash, "write"):
+                    RNS.log(
+                        f"Rejecting resource from {sender_hash} - no write permission",
+                        RNS.LOG_WARNING,
+                    )
+                    return False
+            RNS.log(f"Accepting resource from {sender_hash} ({data_size} bytes)", RNS.LOG_INFO)
+            return True
+
+        if not whitelist_enabled:
+            RNS.log(f"Accepting resource ({data_size} bytes, no whitelist)", RNS.LOG_INFO)
+            return True
+
+        RNS.log("Rejecting resource - no sender identity and whitelist enabled", RNS.LOG_WARNING)
+        return False
+
+    except Exception as e:
+        RNS.log(f"Error in resource_callback: {e}", RNS.LOG_ERROR)
+        import traceback
+        RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
+        return False
 
 
 def resource_started(resource):
