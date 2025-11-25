@@ -543,6 +543,7 @@ class SimpleTUI:
         Args:
             full_clear: Whether to clear the screen before refreshing.
             refresh_input: Whether to refresh the input area (default: False to avoid interrupting typing).
+
         """
         if not self.enabled:
             return
@@ -1173,7 +1174,7 @@ def packet_received(message, packet):
     try:
         data = umsgpack.unpackb(message)
         msg_type = data.get("type")
-        
+
 
         if msg_type == "file_list":
             handle_peer_file_list(data, packet.link)
@@ -1234,14 +1235,14 @@ def handle_peer_file_list(data, link):
 
     current_files = scan_directory(sync_directory)
     RNS.log(f"Comparing {len(peer_files)} peer files with {len(current_files)} local files", RNS.LOG_INFO)
-    
+
     if len(peer_files) == 0:
         RNS.log("Peer has no files to sync", RNS.LOG_INFO)
         return
 
     files_to_request = []
     files_to_sync = []
-    
+
     with file_hashes_lock:
         for filepath, peer_info in peer_files.items():
             local_info = current_files.get(filepath)
@@ -1254,7 +1255,7 @@ def handle_peer_file_list(data, link):
                 files_to_sync.append(filepath)
                 RNS.log(f"File differs, requesting blocks: {filepath}", RNS.LOG_INFO)
                 request_file_blocks(link, filepath)
-    
+
     if files_to_request or files_to_sync:
         RNS.log(f"Sync initiated: {len(files_to_request)} new files, {len(files_to_sync)} modified files", RNS.LOG_INFO)
     else:
@@ -1375,9 +1376,9 @@ def handle_file_request(data, link):
                             tui.update_status(speed=transfer_stats["current_speed"])
 
             resource.progress_callback(progress_callback)
-            
+
             RNS.log(f"File {filepath} resource created, waiting for acceptance...", RNS.LOG_VERBOSE)
-            
+
             timeout = 30
             start_wait = time.time()
             while resource.status < RNS.Resource.TRANSFERRING and resource.status != RNS.Resource.REJECTED:
@@ -1389,13 +1390,13 @@ def handle_file_request(data, link):
                     RNS.log(f"File {filepath} resource failed", RNS.LOG_ERROR)
                     return
                 time.sleep(0.1)
-            
+
             if resource.status == RNS.Resource.REJECTED:
                 RNS.log(f"File {filepath} resource was rejected by peer", RNS.LOG_WARNING)
                 return
-            
+
             RNS.log(f"File {filepath} resource accepted, transfer in progress...", RNS.LOG_VERBOSE)
-            
+
             time.sleep(0.1)
 
         except Exception as e:
@@ -1469,12 +1470,12 @@ def handle_delta_request(data, link):
                 bytes_sent += len(block_data)
 
                 sub_chunk_count = (len(block_data) + MAX_PACKET_DATA_SIZE - 1) // MAX_PACKET_DATA_SIZE
-                
+
                 for sub_idx in range(sub_chunk_count):
                     start_pos = sub_idx * MAX_PACKET_DATA_SIZE
                     end_pos = min(start_pos + MAX_PACKET_DATA_SIZE, len(block_data))
                     sub_chunk_data = block_data[start_pos:end_pos]
-                    
+
                     chunk_data = umsgpack.packb(
                         {
                             "type": "file_chunk",
@@ -1534,9 +1535,10 @@ def resource_callback(resource):
 
     Returns:
         True if resource should be accepted, False otherwise.
+
     """
     sender_identity = resource.link.get_remote_identity()
-    
+
     if sender_identity:
         if whitelist_enabled:
             if not check_permission(sender_identity.hash, "write"):
@@ -1546,7 +1548,7 @@ def resource_callback(resource):
                 )
                 return False
         return True
-    
+
     return not whitelist_enabled
 
 
@@ -1555,11 +1557,12 @@ def resource_started(resource):
 
     Args:
         resource: RNS Resource object.
+
     """
     filepath = None
     if resource.metadata and "filepath" in resource.metadata:
         filepath = resource.metadata["filepath"].decode("utf-8")
-    
+
     if filepath:
         RNS.log(f"Receiving file resource: {filepath}", RNS.LOG_INFO)
 
@@ -1569,6 +1572,7 @@ def resource_concluded(resource):
 
     Args:
         resource: RNS Resource object.
+
     """
     if resource.status != RNS.Resource.COMPLETE:
         filepath = None
@@ -1678,8 +1682,6 @@ def handle_file_chunk(data, link):
     link.download_buffers[filepath]["chunks"][chunk_num]["sub_chunks"][sub_chunk_idx] = chunk_data
     link.download_buffers[filepath]["chunks"][chunk_num]["total_sub_chunks"] = sub_chunk_total
 
-    received_sub_chunks = len(link.download_buffers[filepath]["chunks"][chunk_num]["sub_chunks"])
-    
     if mode == "delta":
         RNS.log(
             f"Received delta block {chunk_num} sub-chunk {sub_chunk_idx + 1}/{sub_chunk_total} for {filepath}",
@@ -1703,7 +1705,7 @@ def handle_file_complete(data, link):
     filepath = data.get("path")
     expected_hash = data.get("hash")
     mode = data.get("mode", "full")
-    
+
     if filepath not in link.download_buffers:
         RNS.log(f"No download buffer for {filepath}, waiting for chunks...", RNS.LOG_DEBUG)
         time.sleep(0.5)
@@ -1731,30 +1733,30 @@ def handle_file_complete(data, link):
 
     try:
         buffer_info = link.download_buffers[filepath]
-        
+
         reassembled_chunks = []
         for chunk_num in sorted(buffer_info["chunks"].keys()):
             chunk_info = buffer_info["chunks"][chunk_num]
             sub_chunks = chunk_info["sub_chunks"]
             total_sub_chunks = chunk_info["total_sub_chunks"]
-            
+
             if len(sub_chunks) < total_sub_chunks:
                 RNS.log(
                     f"Incomplete sub-chunks for block {chunk_num}: {len(sub_chunks)}/{total_sub_chunks}",
                     RNS.LOG_WARNING,
                 )
                 continue
-            
+
             complete_chunk = b"".join([sub_chunks[i] for i in sorted(sub_chunks.keys())])
             reassembled_chunks.append((chunk_num, complete_chunk))
-        
+
         chunks = reassembled_chunks
         expected_size = buffer_info.get("size", 0)
 
         if mode != "delta" and expected_size > 0:
             total_received = sum(len(chunk[1]) for chunk in chunks)
             expected_chunks = (expected_size + BLOCK_SIZE - 1) // BLOCK_SIZE
-            
+
             if len(chunks) < expected_chunks or total_received < expected_size:
                 RNS.log(
                     f"File incomplete: {filepath} - received {len(chunks)}/{expected_chunks} chunks, "
@@ -1762,20 +1764,20 @@ def handle_file_complete(data, link):
                     RNS.LOG_WARNING,
                 )
                 time.sleep(1.0)
-                
+
                 reassembled_chunks = []
                 for chunk_num in sorted(link.download_buffers[filepath]["chunks"].keys()):
                     chunk_info = link.download_buffers[filepath]["chunks"][chunk_num]
                     sub_chunks = chunk_info["sub_chunks"]
                     total_sub_chunks = chunk_info["total_sub_chunks"]
-                    
+
                     if len(sub_chunks) == total_sub_chunks:
                         complete_chunk = b"".join([sub_chunks[i] for i in sorted(sub_chunks.keys())])
                         reassembled_chunks.append((chunk_num, complete_chunk))
-                
+
                 chunks = reassembled_chunks
                 total_received = sum(len(chunk[1]) for chunk in chunks)
-                
+
                 if len(chunks) < expected_chunks or total_received < expected_size:
                     RNS.log(
                         f"File still incomplete after wait: {filepath} - received {len(chunks)}/{expected_chunks} chunks, "
@@ -2032,13 +2034,13 @@ def file_monitor():
                 if tui:
                     tui.update_status(files=len(file_hashes))
                     tui.update_file_list(sync_directory)
-                
+
                 for filepath in added:
                     broadcast_file_update(filepath)
-                
+
                 for filepath in removed:
                     broadcast_file_deletion(filepath)
-                
+
                 for filepath in modified:
                     broadcast_file_update(filepath)
 
@@ -2121,17 +2123,17 @@ def connect_to_peer(peer_hash_hex):
     link.set_resource_callback(resource_callback)
     link.set_resource_started_callback(resource_started)
     link.set_resource_concluded_callback(resource_concluded)
-    
+
     with connected_peers_lock:
         if link not in connected_peers:
             connected_peers.append(link)
 
     time.sleep(0.2)
-    
+
     try:
         remote_identity = link.get_remote_identity()
         identity_hash = remote_identity.hash if remote_identity else None
-        
+
         if (
             (identity_hash and check_permission(identity_hash, "read"))
             or not whitelist_enabled
