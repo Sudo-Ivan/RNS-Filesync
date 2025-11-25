@@ -27,6 +27,7 @@ APP_TIMEOUT = 30.0
 BLOCK_SIZE = 4096
 CHUNK_SIZE = 7000
 SCAN_INTERVAL = 5.0
+MAX_PACKET_DATA_SIZE = 256
 
 peer_identity = None
 peer_destination = None
@@ -1185,6 +1186,10 @@ def packet_received(message, packet):
             handle_block_hashes_response(data, packet.link)
         elif msg_type == "delta_request":
             handle_delta_request(data, packet.link)
+        elif msg_type == "file_chunk":
+            handle_file_chunk(data, packet.link)
+        elif msg_type == "file_complete":
+            handle_file_complete(data, packet.link)
         elif msg_type == "file_update":
             handle_file_update_notification(data, packet.link)
         elif msg_type == "file_deletion":
@@ -1265,6 +1270,7 @@ def request_file(link, filepath):
 
     """
     try:
+        RNS.log(f"Requesting file from peer: {filepath}", RNS.LOG_INFO)
         data = umsgpack.packb(
             {
                 "type": "file_request",
@@ -1462,21 +1468,30 @@ def handle_delta_request(data, link):
                 block_data = f.read(BLOCK_SIZE)
                 bytes_sent += len(block_data)
 
-                chunk_data = umsgpack.packb(
-                    {
-                        "type": "file_chunk",
-                        "path": filepath,
-                        "chunk_num": block_num,
-                        "data": block_data,
-                        "size": file_size,
-                        "mode": "delta",
-                        "total_blocks": len(local_blocks),
-                    },
-                )
+                sub_chunk_count = (len(block_data) + MAX_PACKET_DATA_SIZE - 1) // MAX_PACKET_DATA_SIZE
+                
+                for sub_idx in range(sub_chunk_count):
+                    start_pos = sub_idx * MAX_PACKET_DATA_SIZE
+                    end_pos = min(start_pos + MAX_PACKET_DATA_SIZE, len(block_data))
+                    sub_chunk_data = block_data[start_pos:end_pos]
+                    
+                    chunk_data = umsgpack.packb(
+                        {
+                            "type": "file_chunk",
+                            "path": filepath,
+                            "chunk_num": block_num,
+                            "sub_chunk_idx": sub_idx,
+                            "sub_chunk_total": sub_chunk_count,
+                            "data": sub_chunk_data,
+                            "size": file_size,
+                            "mode": "delta",
+                            "total_blocks": len(local_blocks),
+                        },
+                    )
 
-                packet = RNS.Packet(link, chunk_data)
-                packet.send()
-                time.sleep(0.01)
+                    packet = RNS.Packet(link, chunk_data)
+                    packet.send()
+                    time.sleep(0.01)
 
         end_time = time.time()
         transfer_time = end_time - start_time
@@ -1643,21 +1658,38 @@ def handle_file_chunk(data, link):
     chunk_num = data.get("chunk_num")
     chunk_data = data.get("data")
     mode = data.get("mode", "full")
+    sub_chunk_idx = data.get("sub_chunk_idx", 0)
+    sub_chunk_total = data.get("sub_chunk_total", 1)
 
     if filepath not in link.download_buffers:
         link.download_buffers[filepath] = {
-            "chunks": [],
+            "chunks": {},
             "mode": mode,
             "size": data.get("size", 0),
             "total_blocks": data.get("total_blocks", 0),
         }
 
-    link.download_buffers[filepath]["chunks"].append((chunk_num, chunk_data))
+    if chunk_num not in link.download_buffers[filepath]["chunks"]:
+        link.download_buffers[filepath]["chunks"][chunk_num] = {
+            "sub_chunks": {},
+            "total_sub_chunks": sub_chunk_total,
+        }
 
+    link.download_buffers[filepath]["chunks"][chunk_num]["sub_chunks"][sub_chunk_idx] = chunk_data
+    link.download_buffers[filepath]["chunks"][chunk_num]["total_sub_chunks"] = sub_chunk_total
+
+    received_sub_chunks = len(link.download_buffers[filepath]["chunks"][chunk_num]["sub_chunks"])
+    
     if mode == "delta":
-        RNS.log(f"Received delta block {chunk_num} for {filepath}", RNS.LOG_DEBUG)
+        RNS.log(
+            f"Received delta block {chunk_num} sub-chunk {sub_chunk_idx + 1}/{sub_chunk_total} for {filepath}",
+            RNS.LOG_DEBUG,
+        )
     else:
-        RNS.log(f"Received chunk {chunk_num} for {filepath}", RNS.LOG_DEBUG)
+        RNS.log(
+            f"Received chunk {chunk_num} sub-chunk {sub_chunk_idx + 1}/{sub_chunk_total} for {filepath}",
+            RNS.LOG_DEBUG,
+        )
 
 
 def handle_file_complete(data, link):
@@ -1699,12 +1731,29 @@ def handle_file_complete(data, link):
 
     try:
         buffer_info = link.download_buffers[filepath]
-        chunks = sorted(buffer_info["chunks"], key=lambda x: x[0])
+        
+        reassembled_chunks = []
+        for chunk_num in sorted(buffer_info["chunks"].keys()):
+            chunk_info = buffer_info["chunks"][chunk_num]
+            sub_chunks = chunk_info["sub_chunks"]
+            total_sub_chunks = chunk_info["total_sub_chunks"]
+            
+            if len(sub_chunks) < total_sub_chunks:
+                RNS.log(
+                    f"Incomplete sub-chunks for block {chunk_num}: {len(sub_chunks)}/{total_sub_chunks}",
+                    RNS.LOG_WARNING,
+                )
+                continue
+            
+            complete_chunk = b"".join([sub_chunks[i] for i in sorted(sub_chunks.keys())])
+            reassembled_chunks.append((chunk_num, complete_chunk))
+        
+        chunks = reassembled_chunks
         expected_size = buffer_info.get("size", 0)
 
         if mode != "delta" and expected_size > 0:
             total_received = sum(len(chunk[1]) for chunk in chunks)
-            expected_chunks = (expected_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+            expected_chunks = (expected_size + BLOCK_SIZE - 1) // BLOCK_SIZE
             
             if len(chunks) < expected_chunks or total_received < expected_size:
                 RNS.log(
@@ -1713,7 +1762,18 @@ def handle_file_complete(data, link):
                     RNS.LOG_WARNING,
                 )
                 time.sleep(1.0)
-                chunks = sorted(link.download_buffers[filepath]["chunks"], key=lambda x: x[0])
+                
+                reassembled_chunks = []
+                for chunk_num in sorted(link.download_buffers[filepath]["chunks"].keys()):
+                    chunk_info = link.download_buffers[filepath]["chunks"][chunk_num]
+                    sub_chunks = chunk_info["sub_chunks"]
+                    total_sub_chunks = chunk_info["total_sub_chunks"]
+                    
+                    if len(sub_chunks) == total_sub_chunks:
+                        complete_chunk = b"".join([sub_chunks[i] for i in sorted(sub_chunks.keys())])
+                        reassembled_chunks.append((chunk_num, complete_chunk))
+                
+                chunks = reassembled_chunks
                 total_received = sum(len(chunk[1]) for chunk in chunks)
                 
                 if len(chunks) < expected_chunks or total_received < expected_size:
@@ -1802,17 +1862,25 @@ def handle_file_update_notification(data, link):
     filepath = data.get("path")
     peer_info = data.get("info")
 
+    if not peer_info:
+        RNS.log(f"Received file update without peer_info for {filepath}", RNS.LOG_WARNING)
+        return
+
     with file_hashes_lock:
         local_info = file_hashes.get(filepath)
 
-    if not local_info or local_info["hash"] != peer_info["hash"]:
-        RNS.log(f"File update available: {filepath}", RNS.LOG_INFO)
-
+    if not local_info:
+        RNS.log(f"New file available from peer: {filepath}", RNS.LOG_INFO)
+        request_file(link, filepath)
+    elif local_info["hash"] != peer_info["hash"]:
+        RNS.log(f"File update available (hash differs): {filepath}", RNS.LOG_INFO)
         full_path = os.path.join(sync_directory, filepath)
         if os.path.exists(full_path):
             request_file_blocks(link, filepath)
         else:
             request_file(link, filepath)
+    else:
+        RNS.log(f"File {filepath} is already up to date", RNS.LOG_DEBUG)
 
 
 def broadcast_file_update(filepath, exclude_link=None):
@@ -1825,6 +1893,10 @@ def broadcast_file_update(filepath, exclude_link=None):
     """
     with connected_peers_lock:
         peers = list(connected_peers)
+
+    if not peers:
+        RNS.log(f"No peers to broadcast update for {filepath}", RNS.LOG_DEBUG)
+        return
 
     for link in peers:
         if link != exclude_link and link.status == RNS.Link.ACTIVE:
@@ -1843,6 +1915,9 @@ def broadcast_file_update(filepath, exclude_link=None):
 
                     packet = RNS.Packet(link, data)
                     packet.send()
+                    RNS.log(f"Sent file update notification for {filepath} to peer", RNS.LOG_VERBOSE)
+                else:
+                    RNS.log(f"No file info found for {filepath} in broadcast", RNS.LOG_WARNING)
             except Exception as e:
                 RNS.log(f"Error broadcasting update: {e}", RNS.LOG_DEBUG)
 
@@ -1939,25 +2014,33 @@ def file_monitor():
                 for filepath in added:
                     RNS.log(f"New file detected: {filepath}", RNS.LOG_INFO)
                     file_hashes[filepath] = current_files[filepath]
-                    broadcast_file_update(filepath)
 
                 for filepath in removed:
                     RNS.log(f"File removed: {filepath}", RNS.LOG_INFO)
                     del file_hashes[filepath]
-                    broadcast_file_deletion(filepath)
 
+                modified = []
                 for filepath in potentially_modified:
                     if file_hashes[filepath]["hash"] != current_files[filepath]["hash"]:
                         RNS.log(f"File modified: {filepath}", RNS.LOG_INFO)
                         file_hashes[filepath] = current_files[filepath]
-                        broadcast_file_update(filepath)
+                        modified.append(filepath)
 
-            if added or removed or potentially_modified:
+            if added or removed or modified:
                 save_hash_db(sync_directory)
 
                 if tui:
                     tui.update_status(files=len(file_hashes))
                     tui.update_file_list(sync_directory)
+                
+                for filepath in added:
+                    broadcast_file_update(filepath)
+                
+                for filepath in removed:
+                    broadcast_file_deletion(filepath)
+                
+                for filepath in modified:
+                    broadcast_file_update(filepath)
 
             time.sleep(SCAN_INTERVAL)
 
